@@ -1,9 +1,14 @@
 # %%
 import itertools
+import matplotlib.pyplot as plt
+import pandas as pd
 import requests
+import seaborn as sns
 import time
 
-from typing import Dict, Generator, List, Optional, Union
+
+from IPython.display import display, Markdown
+from typing import Dict, Generator, Iterator, List, Optional, Union
 from urllib import parse
 
 # %%
@@ -21,7 +26,7 @@ def print_assert_ok(response: requests.Response) -> None:
 
 def spin_get(
     *args,
-    session: Union[type(requests), requests.Session] = requests,
+    session: Optional[requests.Session] = None,
     assert_ok: bool = True,
     **kwargs,
 ) -> requests.Response:
@@ -31,7 +36,10 @@ def spin_get(
     gets += 1
 
     while True:
-        response = session.get(*args, **kwargs)
+        if session is None:
+            response = requests.get(*args, **kwargs)
+        else:
+            response = session.get(*args, **kwargs)
 
         if response.status_code == requests.codes["too_many_requests"]:
             global backoffs
@@ -47,8 +55,13 @@ def spin_get(
             return response
 
 
-def spotify_yield_from_page(url: str, session: requests.Session) -> Generator:
+def spotify_yield_from_page(
+    url: str,
+    session: requests.Session,
+) -> Iterator[Dict]:
     response = spin_get(url=url, session=session)
+
+    print_assert_ok(response)
 
     items: List = response.json()["items"]
     next_url: Optional[str] = response.json()["next"]
@@ -59,7 +72,9 @@ def spotify_yield_from_page(url: str, session: requests.Session) -> Generator:
             yield from spotify_yield_from_page(url=next_url, session=session)
 
 
-def spotify_yield_from_list(url: str, session: requests.Session, **kwargs) -> Generator:
+def spotify_yield_from_list(
+    url: str, session: requests.Session, **kwargs
+) -> Iterator[Dict]:
     response = session.get(url, **kwargs)
     print_assert_ok(response)
     # Assume all we get back is a list
@@ -78,15 +93,14 @@ def grouper(n, iterable):
         yield chunk
 
 
-def standardise_track_generator(
-    candidate_generator: Generator[dict, None, None]
-) -> Generator[dict, None, None]:
+def standardise_track_generator(candidate_generator: Iterator[Dict]) -> Iterator[Dict]:
     """Spotify has two types track objects:
-    `saved_track_object` etc. - {added_at: ..., track: ...}
+    `saved_track_object` etc. = {added_at: ..., track: ...}
     `track_object` = {...}
 
     This leaves the former unchanged, and returns the latter as
     {track: ...}"""
+
     peek = next(candidate_generator)
 
     if "track" in peek.keys():
@@ -102,8 +116,8 @@ def standardise_track_generator(
 
 
 def tracks_get_audio_features(
-    track_generator: Generator[dict, None, None], session: requests.Session
-) -> Generator[dict, None, None]:
+    track_generator: Iterator[Dict], session: requests.Session
+) -> Iterator[Dict]:
 
     maximum_queries_per_request = 100
 
@@ -126,14 +140,12 @@ def tracks_get_audio_features(
 
 
 def spotify_track_pager_add_audio_features(
-    token: str, track_pager_url: str, append_user: bool = True
-):
+    token: str, track_pager_url: str
+) -> Iterator[Dict]:
 
     # Establish a session for authorization
     with requests.Session() as session:
         session.headers["Authorization"] = f"Bearer {token}"
-
-        user = spin_get(url="https://api.spotify.com/v1/me", session=session).json()
 
         track_generator = spotify_yield_from_page(url=track_pager_url, session=session)
         track_generator = standardise_track_generator(track_generator)
@@ -147,7 +159,6 @@ def spotify_track_pager_add_audio_features(
         yield from (
             {
                 **track_object,
-                "user": user,
                 "audio_features": audio_features,
             }
             for track_object, audio_features in zip(g1, audio_features_generator)
@@ -156,19 +167,18 @@ def spotify_track_pager_add_audio_features(
 
 # %%
 
-# gets pages of https://developer.spotify.com/documentation/web-api/reference/object-model/#saved-track-object
-library_url = "https://api.spotify.com/v1/me/tracks"
+base_url = "https://api.spotify.com/v1"
 top_urls = {
     (
         typ,
         time_range,
-    ): f"https://api.spotify.com/v1/me/top/{typ}?time_range={time_range}"
+    ): f"{base_url}/me/top/{typ}?time_range={time_range}"
     for typ, time_range in itertools.product(
         ["artists", "tracks"], ["long_term", "medium_term", "short_term"]
     )
 }
 
-scopes = [
+all_scopes = [
     line
     for line in """\
 ugc-image-upload
@@ -194,8 +204,13 @@ playlist-modify-private
 ]
 
 
-def generate_auth_url():
-    global scopes
+def generate_auth_url(scopes: List[str]):
+    global all_scopes
+
+    for scope in scopes:
+        if scope not in all_scopes:
+            raise RuntimeError("Not sure that's a valid scope")
+
     pr = requests.PreparedRequest()
     pr.prepare_url(
         url="https://accounts.spotify.com/authorize",
@@ -203,7 +218,7 @@ def generate_auth_url():
             "client_id": "6306b3af252b4b2c8a55c1db34c5da95",
             "response_type": "token",
             "redirect_uri": "https://example.com",
-            "scope": " ".join(scope for scope in scopes if "read" in scope),
+            "scope": " ".join(scopes),
         },
     )
     return pr.url
@@ -213,3 +228,62 @@ def url_get_token(url: str):
     split = parse.urlsplit(url)
     queries = parse.parse_qs(split.fragment)
     return queries["access_token"].pop()
+
+
+# %%
+
+
+def plot_features_popularity(df: pd.DataFrame, hue: str = "user.display_name"):
+
+    features: pd.DataFrame = pd.read_csv(
+        filepath_or_buffer="audio_features.table", delimiter="\t", comment="#"
+    )
+
+    # Pandas didn't interpret ints. Fix.
+    for feature in features.to_dict(orient="index").values():
+        if feature["VALUE TYPE"] == "int":
+            column = f"audio_features.{feature['KEY']}"
+            df[column] = df[column].astype("int", errors="ignore")
+
+    df["track.popularity"] = df["track.popularity"].astype("int")
+
+    for feature in features.to_dict(orient="index").values():
+        if feature["VALUE TYPE"] not in ("int", "float"):
+            # Non-numeric data. Don't plot
+            continue
+
+        clip = (0, 1) if feature["unit interval?"] else None
+        key = feature["KEY"]
+
+        fig: plt.Figure
+        ax: plt.Axes
+        fig, ax = plt.subplots(figsize=(12, 6))
+        sns.kdeplot(
+            data=df,
+            x=f"audio_features.{key}",
+            hue=hue,
+            common_norm=False,
+            fill=True,
+            ax=ax,
+            clip=clip,
+        )
+        ax.set(title=key.title(), xlim=clip)
+
+        display(Markdown(data=f"# {key.title()}"))
+        display(fig)
+        display(Markdown(data=feature["VALUE DESCRIPTION"]))
+        plt.close(fig)  # We display manually, so don't let matplotlib
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    sns.kdeplot(
+        data=df,
+        x="track.popularity",
+        hue=hue,
+        common_norm=False,
+        fill=True,
+        ax=ax,
+        clip=(0, 100),
+    )
+    ax.set(title="Popularity", xlim=(0, 100))
+    display(Markdown(data="# Popularity"))
+    fig.show()
