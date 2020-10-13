@@ -1,106 +1,56 @@
 # %%
-import flat_table
-import itertools
-import matplotlib.pyplot as plt
+import flatten_dict
 import pandas as pd
+import pyperclip
 import requests
-import seaborn as sns
 import utils
 
-from IPython.display import display, Markdown
-
-import importlib
-
-importlib.reload(utils)
+from typing import List
 
 # %%
+# Convenience for getting permission
+scopes = [scope for scope in utils.all_scopes if "read" in scope]
+pyperclip.copy(utils.generate_auth_url(scopes=scopes))
+token = utils.url_get_token(input("Authorized URL"))
 
+# %%
+# Session object to deal with auth
 session = requests.Session()
-token = "CHANGEME"
 session.headers["Authorization"] = f"Bearer {token}"
 
-user_id = "CHANGEME"
-
+# %%
 playlists = utils.spotify_yield_from_page(
-    url=f"https://api.spotify.com/v1/users/{user_id}/playlists", session=session
+    url=f"{utils.base_url}/me/playlists", session=session
 )
 
-# %%
-dfs = []
+dfs: List[pd.DataFrame] = []
+
+# Gather all our data
 for playlist in playlists:
-    playlist_id = playlist["id"]
-    print(playlist["name"], end="")
-    tracks = utils.spotify_track_pager_add_audio_features(
-        token=token,
-        track_pager_url=f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks",
-    )
-    df = pd.DataFrame(tracks)
-    df["playlist"] = list(itertools.repeat(playlist, len(df)))
-    df = flat_table.normalize(df=df, expand_dicts=True, expand_lists=False)
-    print(f": {len(df)}")
-    dfs.append(df)
+    print(playlist["name"])
 
-
-# %%
-df = pd.concat(dfs, axis="rows")
-# Some not permitted tracks have NaN features. Drop.
-df = df[df["audio_features.duration_ms"].notna()]
-
-# %%
-features: pd.DataFrame = pd.read_csv(
-    filepath_or_buffer="audio_features.table", delimiter="\t", comment="#"
-)
-
-# %%
-# Pandas didn't interpret ints. Fix.
-for feature in features.to_dict(orient="index").values():
-    if feature["VALUE TYPE"] == "int":
-        column = f"audio_features.{feature['KEY']}"
-        df[column] = df[column].astype("int", errors="ignore")
-
-df["track.popularity"] = df["track.popularity"].astype("int")
-# %%
-for feature in features.to_dict(orient="index").values():
-
-    if feature["VALUE TYPE"] not in ("int", "float"):
-        # Non-numeric data. Don't plot
+    if playlist["name"] == "Windows Media Player":
+        # zero length!
         continue
 
-    clip = (0, 1) if feature["unit interval?"] else None
-    key = feature["KEY"]
-
-    fig: plt.Figure
-    ax: plt.Axes
-    fig, ax = plt.subplots(figsize=(12, 6))
-    sns.kdeplot(
-        data=df,
-        x=f"audio_features.{key}",
-        hue="playlist.name",
-        common_norm=False,
-        fill=True,
-        ax=ax,
-        clip=clip,
+    tracks = utils.spotify_track_pager_add_audio_features(
+        token=token,
+        track_pager_url=f"{utils.base_url}/playlists/{playlist['id']}/tracks",
     )
-    ax.set(title=key.title(), xlim=clip)
 
-    display(Markdown(data=f"# {key.title()}"))
-    display(fig)
-    display(Markdown(data=feature["VALUE DESCRIPTION"]))
-    plt.close(fig)  # We display manually, so don't let matplotlib
+    # Add a playlist column for comparing between playlists
+    tracks = ({**track, "playlist": playlist} for track in tracks)
+
+    tracks = (flatten_dict.flatten(d=track, reducer="dot") for track in tracks)
+
+    df = pd.DataFrame(tracks)
+    dfs.append(df)
+
+# Merge into one table
+df = pd.concat(dfs, axis="index")
 
 # %%
-fig: plt.Figure
-ax: plt.Axes
-fig, ax = plt.subplots(figsize=(12, 6))
-sns.kdeplot(
-    data=df,
-    x="track.popularity",
-    hue="user.display_name",
-    common_norm=False,
-    fill=True,
-    ax=ax,
-    clip=(0, 100),
-)
-ax.set(title="Popularity", xlim=(0, 100))
-display(Markdown(data="# Popularity"))
-fig.show()
+# Plot different curves for each hue
+utils.plot_features_popularity(df=df, hue="playlist.name")
+
+# %%

@@ -1,80 +1,49 @@
-# To add a new cell, type '# %%'
-# To add a new markdown cell, type '# %% [markdown]'
 # %%
-import flat_table
-import ipywidgets as widgets
-import matplotlib.pyplot as plt
+import flatten_dict
 import pandas as pd
-import seaborn as sns
+import pyperclip
+import requests
 import utils
 
-from IPython.display import display, Markdown
+from typing import List
 
 # %%
-data = pd.HDFStore(path="data.hdf")
-print(data.keys())
-df0 = pd.read_hdf(path_or_buf=data, key=input(f"One of: {data.keys()}"))
-df1 = pd.read_hdf(path_or_buf=data, key=input(f"One of: {data.keys()}"))
-df2 = pd.read_hdf(path_or_buf=data, key=input(f"One of: {data.keys()}"))
-df = pd.concat([df0,df1,df2], axis="rows")
-data.close()
+scopes = [scope for scope in utils.all_scopes if "read" in scope]
+pyperclip.copy(utils.generate_auth_url(scopes=scopes))
+
+tokens: List[str] = []
+
+while True:
+    try:
+        token = utils.url_get_token(input("Authorized URL"))
+        tokens.append(token)
+    except KeyError:
+        break
 
 # %%
-features: pd.DataFrame = pd.read_csv(
-    filepath_or_buffer="audio_features.table", delimiter="\t", comment="#"
-)
+dfs: List[pd.DataFrame] = []
 
-# %%
-# Pandas didn't interpret ints. Fix.
-for feature in features.to_dict(orient="index").values():
-    if feature["VALUE TYPE"] == "int":
-        column = f"audio_features.{feature['KEY']}"
-        df[column] = df[column].astype("int")
+for token in tokens:
 
-df["track.popularity"] = df["track.popularity"].astype("int")
+    session = requests.Session()
+    session.headers["Authorization"] = f"Bearer {token}"
+    user = session.get(url=f"{utils.base_url}/me").json()
 
-# %%
-for feature in features.to_dict(orient="index").values():
-
-    if feature["VALUE TYPE"] not in ("int", "float"):
-        # Non-numeric data. Don't plot
-        continue
-
-    clip = (0, 1) if feature["unit interval?"] else None
-    key = feature["KEY"]
-
-    fig: plt.Figure
-    ax: plt.Axes
-    fig, ax = plt.subplots(figsize=(12, 6))
-    sns.kdeplot(
-        data=df,
-        x=f"audio_features.{key}",
-        hue="user.display_name",
-        common_norm=False,
-        fill=True,
-        ax=ax,
-        clip=clip,
+    tracks = utils.spotify_track_pager_add_audio_features(
+        token=token, track_pager_url=f"{utils.base_url}/me/tracks"
     )
-    ax.set(title=key.title(), xlim=clip)
 
-    display(Markdown(data=f"# {key.title()}"))
-    display(fig)
-    display(Markdown(data=feature["VALUE DESCRIPTION"]))
-    plt.close(fig)  # We display manually, so don't let matplotlib
+    # Add a user column for comparing between users
+    tracks = ({**track, "user": user} for track in tracks)
+
+    tracks = (flatten_dict.flatten(d=track, reducer="dot") for track in tracks)
+
+    # Make a table
+    df = pd.DataFrame(tracks)
+
+    df.added_at = pd.to_datetime(df.added_at)
+
+df = pd.concat(dfs, axis="index")
 
 # %%
-fig: plt.Figure
-ax: plt.Axes
-fig, ax = plt.subplots(figsize=(12, 6))
-sns.kdeplot(
-    data=df,
-    x="track.popularity",
-    hue="user.display_name",
-    common_norm=False,
-    fill=True,
-    ax=ax,
-    clip=(0, 100),
-)
-ax.set(title="Popularity", xlim=(0, 100))
-display(Markdown(data="# Popularity"))
-fig.show()
+utils.plot_features_popularity(df=df, hue="user.display_name")
